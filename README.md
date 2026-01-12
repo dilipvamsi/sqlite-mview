@@ -17,7 +17,7 @@ While standard SQLite views are virtual (re-calculated every time you query them
 
 This extension uses the **"Sidecar Database" pattern**. It attaches a secondary database file to your connection to store the cache.
 
-```mermaid
+```text
 +-------------+        +--------------------------+
 | Application | -----> |  Main Database (source)  |
 +-------------+        +--------------------------+
