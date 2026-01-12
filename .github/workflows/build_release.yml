@@ -36,7 +36,8 @@ jobs:
               sudo apt-get update
               sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
             # Override CC to use the cross-compiler
-            build_cmd: make CC=aarch64-linux-gnu-gcc
+            # Added LDFLAGS to enforce 4KB page alignment (Removes ~50KB padding)
+            build_cmd: make CC=aarch64-linux-gnu-gcc LDFLAGS="-shared -Wl,-z,max-page-size=4096"
 
           # ==================================================================
           # WINDOWS BUILDS (Cross-compiled from Linux)
