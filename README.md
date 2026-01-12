@@ -118,7 +118,14 @@ Trigger a refresh when your main data changes. This performs a full re-calculati
 SELECT mview_refresh('daily_stats');
 ```
 
-### 7. Clean Up
+### 7. Drop a View
+Permanently remove a view and its metadata from the registry.
+
+```sql
+SELECT mview_drop('daily_stats');
+```
+
+### 8. Clean Up
 Detaches the cache database. Data persists on disk.
 
 ```sql
