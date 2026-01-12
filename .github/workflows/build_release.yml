@@ -49,7 +49,10 @@ jobs:
             install_deps: |
               sudo apt-get update
               sudo apt-get install -y mingw-w64
-            # Uses the Makefile's 'windows' target
+              # Fix: Download SQLite header
+              curl -O https://www.sqlite.org/2023/sqlite-amalgamation-3420000.zip
+              unzip -q sqlite-amalgamation-3420000.zip
+              mv sqlite-amalgamation-3420000/sqlite3ext.h .
             build_cmd: make windows
 
           # 4. Windows x86 (32-bit)
@@ -59,7 +62,10 @@ jobs:
             install_deps: |
               sudo apt-get update
               sudo apt-get install -y mingw-w64
-            # Override Makefile variables to force 32-bit compilation
+              # Fix: Download SQLite header
+              curl -O https://www.sqlite.org/2023/sqlite-amalgamation-3420000.zip
+              unzip -q sqlite-amalgamation-3420000.zip
+              mv sqlite-amalgamation-3420000/sqlite3ext.h .
             build_cmd: make CC=i686-w64-mingw32-gcc TARGET_LIB=build/mview.dll LDFLAGS="-shared"
 
           # 5. Windows ARM64 (LLVM-MinGW)
@@ -70,7 +76,10 @@ jobs:
               curl -L -o llvm-mingw.tar.xz https://github.com/mstorsjo/llvm-mingw/releases/download/20231128/llvm-mingw-20231128-ucrt-ubuntu-20.04-x86_64.tar.xz
               tar -xf llvm-mingw.tar.xz
               echo "$PWD/llvm-mingw-20231128-ucrt-ubuntu-20.04-x86_64/bin" >> $GITHUB_PATH
-            # Override Makefile variables to force ARM64 compilation
+              # Fix: Download SQLite header
+              curl -O https://www.sqlite.org/2023/sqlite-amalgamation-3420000.zip
+              unzip -q sqlite-amalgamation-3420000.zip
+              mv sqlite-amalgamation-3420000/sqlite3ext.h .
             build_cmd: make CC=aarch64-w64-mingw32-gcc TARGET_LIB=build/mview.dll LDFLAGS="-shared"
 
           # ==================================================================
