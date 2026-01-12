@@ -114,18 +114,24 @@ jobs:
       - name: Strip Debug Symbols
         run: |
           cd build
-          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
-            # Windows (MinGW) uses 'strip'
+
+          if [[ "${{ matrix.target }}" == "windows-arm64" ]]; then
+            # Windows ARM64 (LLVM)
+            aarch64-w64-mingw32-strip --strip-unneeded mview.dll
+
+          elif [[ "${{ matrix.target }}" == "linux-arm64" ]]; then
+            # FIX: Linux ARM64 (Uses the specific cross-strip tool)
+            aarch64-linux-gnu-strip --strip-unneeded mview.so
+
+          elif [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            # Windows x86/x64 (Standard MinGW strip)
             strip --strip-unneeded mview.dll
-          elif [[ "${{ matrix.target }}" == *"linux"* ]]; then
-            # Linux uses 'strip'
-            # Note: For cross-compiled ARM64, we should technically use the cross-strip, 
-            # but standard strip often works or we can skip it. 
-            # For simplicity, we only strip native Linux x64 or use generic strip if compatible.
-            strip --strip-unneeded mview.so || true
+
+          elif [[ "${{ matrix.target }}" == "linux-x64" ]]; then
+            # Linux x64 (Standard system strip)
+            strip --strip-unneeded mview.so
           fi
-          # Note: macOS stripping is often handled by linker or specific 'strip -x' 
-          # but requires care with signatures. We can skip it for macOS to be safe.
+          # macOS does not require explicit stripping here (handled by linker usually)
 
       - name: Prepare Artifacts
         run: |
