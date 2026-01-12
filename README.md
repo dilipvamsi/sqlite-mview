@@ -90,6 +90,9 @@ SELECT mview_create(
 );
 ```
 
+> **💡 Best Practice:** Always prefix your source tables with `main.` (e.g., `SELECT * FROM main.orders`). 
+> SQLite searches for tables in the order: `TEMP` -> `MAIN` -> `ATTACHED`. Using `main.` guarantees your view reads from your actual database, preventing accidental conflicts if a temporary table with the same name exists.
+
 ### 4. Create a View (Strict Mode)
 Use this to define a **Primary Key** for performance.
 
