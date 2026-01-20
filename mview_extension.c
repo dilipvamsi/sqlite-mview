@@ -55,14 +55,18 @@
 ** 5. QUERY DATA:
 **    SELECT * FROM mviews.daily_sales WHERE total > 1000;
 **
-** 6. REFRESH DATA:
+** 6. REGISTER INDEX (Crucial for performance):
+**    -- Indexes are re-applied automatically after every refresh
+**    SELECT mview_add_index('daily_sales', 'date', 1); -- 1 = Unique
+**
+** 7. REFRESH DATA:
 **    -- Re-runs the query and updates the table atomically
 **    SELECT mview_refresh('daily_sales');
 **
-** 7. DROP VIEW:
+** 8. DROP VIEW:
 **    SELECT mview_drop('daily_sales');
 **
-** 8. CLOSE / DETACH:
+** 9. CLOSE / DETACH:
 **    SELECT mview_close();
 **
 ** ============================================================================
@@ -71,6 +75,8 @@
 #include "sqlite3ext.h"
 SQLITE_EXTENSION_INIT1
 #include <string.h>
+#include <stdlib.h> /* For malloc/free if needed, though we use sqlite3_malloc */
+#include <stdio.h>
 
 /*
 ** CONSTANT: CACHE_SCHEMA
@@ -131,11 +137,30 @@ static char *quote_identifier(const char *in) {
 }
 
 /*
+** HELPER: get_random_suffix
+** ----------------------------------------------------------------------------
+** Generates a random hex string suffix.
+** Used to create unique temporary table names for concurrent refreshes.
+*/
+static void get_random_suffix(char *buffer, int length) {
+    unsigned char random_bytes[16];
+    int bytes_needed = length / 2;
+    if (bytes_needed > sizeof(random_bytes)) bytes_needed = sizeof(random_bytes);
+
+    sqlite3_randomness(bytes_needed, random_bytes);
+
+    for(int i = 0; i < bytes_needed; i++) {
+        sprintf(&buffer[i*2], "%02x", random_bytes[i]);
+    }
+    buffer[length] = '\0';
+}
+
+/*
 ** HELPER: init_registry
 ** ----------------------------------------------------------------------------
-** Creates the internal bookkeeping table '_mview_registry' inside the
-** attached cache database. This table remembers the SQL query for each view
-** so we can refresh it later.
+** Creates the internal bookkeeping tables inside the attached cache database.
+** 1. _mview_registry: Tracks query definitions.
+** 2. _mview_index_registry: Tracks index definitions for persistence.
 */
 static int init_registry(sqlite3 *db, char **err_msg) {
   const char *sql =
@@ -144,6 +169,12 @@ static int init_registry(sqlite3 *db, char **err_msg) {
       "  source_query TEXT NOT NULL,"
       "  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,"
       "  last_refreshed DATETIME"
+      ");"
+      "CREATE TABLE IF NOT EXISTS " CACHE_SCHEMA "._mview_index_registry ("
+      "  view_name TEXT,"
+      "  columns TEXT,"
+      "  is_unique INTEGER,"
+      "  FOREIGN KEY(view_name) REFERENCES _mview_registry(view_name) ON DELETE CASCADE"
       ");";
   return sqlite3_exec(db, sql, 0, 0, err_msg);
 }
@@ -318,19 +349,83 @@ error_rollback:
 }
 
 /*
+** FUNCTION: mview_add_index
+** SQL USAGE: SELECT mview_add_index('view_name', 'col1, col2', is_unique);
+** ----------------------------------------------------------------------------
+** Registers an index for the view.
+** 1. Saves definition to _mview_index_registry.
+** 2. Immediately applies the index to the current table (if it exists).
+**
+** This ensures indexes are re-created automatically during refresh.
+*/
+static void mview_add_index_func(
+    sqlite3_context *context,
+    int argc,
+    sqlite3_value **argv
+) {
+    sqlite3 *db = sqlite3_context_db_handle(context);
+    const char *view_name = (const char*)sqlite3_value_text(argv[0]);
+    const char *columns   = (const char*)sqlite3_value_text(argv[1]);
+    int is_unique = sqlite3_value_int(argv[2]);
+    char *err_msg = 0;
+
+    // 1. Insert into Registry
+    char *reg_sql = sqlite3_mprintf(
+        "INSERT INTO " CACHE_SCHEMA "._mview_index_registry (view_name, columns, is_unique) VALUES ('%q', '%q', %d)",
+        view_name, columns, is_unique
+    );
+
+    int rc = sqlite3_exec(db, reg_sql, 0, 0, &err_msg);
+    sqlite3_free(reg_sql);
+
+    if (rc != SQLITE_OK) {
+        sqlite3_result_error(context, err_msg, -1);
+        sqlite3_free(err_msg);
+        return;
+    }
+
+    // 2. Apply index immediately to the current live table (Best Effort)
+    char *quoted_name = quote_identifier(view_name);
+
+    // Generate random suffix to ensure unique index name
+    char suffix[9];
+    get_random_suffix(suffix, 8);
+
+    char *sql = sqlite3_mprintf("CREATE %s INDEX IF NOT EXISTS " CACHE_SCHEMA ".idx_%s_%s ON %s (%s)",
+        is_unique ? "UNIQUE" : "",
+        view_name, suffix,
+        quoted_name,
+        columns
+    );
+    sqlite3_free(quoted_name);
+
+    rc = sqlite3_exec(db, sql, 0, 0, &err_msg);
+    sqlite3_free(sql);
+
+    if (rc != SQLITE_OK) {
+        // Safe to ignore error here; table might not exist yet,
+        // or user called this before creating the view.
+        // It will be created on next refresh.
+        sqlite3_free(err_msg);
+    }
+
+    sqlite3_result_text(context, "Index registered", -1, SQLITE_STATIC);
+}
+
+/*
 ** FUNCTION: mview_refresh
 ** SQL USAGE: SELECT mview_refresh('view_name');
 ** ----------------------------------------------------------------------------
-** Updates the data in an existing view.
+** Updates the data in an existing view using a "Shadow Swap" strategy.
 ** Steps:
 ** 1. Lookup the source query from the registry.
-** 2. Start Transaction.
-** 3. Delete all existing rows.
-** 4. Insert new rows by running the source query.
-** 5. Commit.
-**
-** Note: This is an "Atomic Refresh". The view is never empty to other readers
-** (if WAL mode is on) or at least consistent (via transaction).
+** 2. Create a temporary table (view_name_new_random) populated via CTAS.
+**    (This happens OUTSIDE the transaction to allow parallel reads on the old table).
+** 3. Re-create all registered indexes on the temp table.
+** 4. Begin IMMEDIATE Transaction (Locks writers, allows existing readers).
+** 5. Drop old table.
+** 6. Rename temp table to real name.
+** 7. Commit.
 */
 static void mview_refresh_func(sqlite3_context *context, int argc,
                                sqlite3_value **argv) {
@@ -356,59 +451,151 @@ static void mview_refresh_func(sqlite3_context *context, int argc,
     return;
   }
   const char *query = (const char *)sqlite3_column_text(stmt, 0);
-  // Create a copy of the query string before finalizing the statement
   char *saved_query = sqlite3_mprintf("%s", query ? query : "");
   sqlite3_finalize(stmt);
 
-  char *quoted_name = quote_identifier(name);
-  if (!quoted_name) {
-    sqlite3_free(saved_query);
-    sqlite3_result_error_nomem(context);
-    return;
-  }
+  // 2. Prepare Temp Table Name
+  char suffix[9];
+  get_random_suffix(suffix, 8);
+
+  // Name format: viewname_new_a1b2c3d4
+  char *temp_table_name = sqlite3_mprintf("%s_new_%s", name, suffix);
+  char *quoted_temp = quote_identifier(temp_table_name);
+  char *quoted_real = quote_identifier(name);
 
   char *err_msg = NULL;
-  /* BEGIN TRANSACTION */
-  sqlite3_exec(db, "BEGIN TRANSACTION", 0, 0, 0);
 
-  // 2. Wipe old data
-  char *del_sql =
-      sqlite3_mprintf("DELETE FROM " CACHE_SCHEMA ".%s", quoted_name);
-  sqlite3_exec(db, del_sql, 0, 0, 0);
-  sqlite3_free(del_sql);
+  // 3. Create & Populate Temp Table (Heavy Lifting - Non Blocking)
+  // Drop debris if exists (unlikely due to random suffix)
+  char *drop_temp = sqlite3_mprintf("DROP TABLE IF EXISTS " CACHE_SCHEMA ".%s", quoted_temp);
+  sqlite3_exec(db, drop_temp, 0, 0, 0);
+  sqlite3_free(drop_temp);
 
-  // 3. Insert new data
-  // We wrap query in parenthesis: SELECT * FROM (source_query)
-  // This handles complex source queries (like UNIONS) correctly.
-  char *ins_sql =
-      sqlite3_mprintf("INSERT INTO " CACHE_SCHEMA ".%s SELECT * FROM (%s)",
-                      quoted_name, saved_query);
-  int rc = sqlite3_exec(db, ins_sql, 0, 0, &err_msg);
-  sqlite3_free(ins_sql);
-
-  // 4. Update Timestamp
-  if (rc == SQLITE_OK) {
-    char *upd_sql = sqlite3_mprintf("UPDATE " CACHE_SCHEMA
-                                    "._mview_registry SET last_refreshed = "
-                                    "CURRENT_TIMESTAMP WHERE view_name = '%q'",
-                                    name);
-    sqlite3_exec(db, upd_sql, 0, 0, 0);
-    sqlite3_free(upd_sql);
-  }
-
+  // Run CTAS
+  char *create_sql = sqlite3_mprintf("CREATE TABLE " CACHE_SCHEMA ".%s AS SELECT * FROM (%s)",
+                                     quoted_temp, saved_query);
+  int rc = sqlite3_exec(db, create_sql, 0, 0, &err_msg);
+  sqlite3_free(create_sql);
   sqlite3_free(saved_query);
-  sqlite3_free(quoted_name);
 
   if (rc != SQLITE_OK) {
-    /* ROLLBACK on failure (restores deleted data) */
-    sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
-    sqlite3_result_error(context, err_msg, -1);
-    sqlite3_free(err_msg);
-  } else {
-    /* COMMIT on success */
-    sqlite3_exec(db, "COMMIT", 0, 0, 0);
-    sqlite3_result_text(context, "Refreshed", -1, SQLITE_TRANSIENT);
+      sqlite3_free(quoted_temp);
+      sqlite3_free(quoted_real);
+      sqlite3_free(temp_table_name);
+      sqlite3_result_error(context, err_msg, -1);
+      sqlite3_free(err_msg);
+      return;
   }
+
+  // 4. Apply Indexes to Temp Table
+  // We must look up registered indexes and create them on the temp table now
+  char *idx_query = sqlite3_mprintf("SELECT columns, is_unique FROM " CACHE_SCHEMA
+                                    "._mview_index_registry WHERE view_name = '%q'", name);
+
+  if (sqlite3_prepare_v2(db, idx_query, -1, &stmt, 0) == SQLITE_OK) {
+      int idx_counter = 0;
+      while (sqlite3_step(stmt) == SQLITE_ROW) {
+          const char *cols = (const char*)sqlite3_column_text(stmt, 0);
+          int is_unique = sqlite3_column_int(stmt, 1);
+
+          // Create index on temp table. It will carry over during rename.
+          // Name: idx_suffix_counter (to ensure uniqueness)
+          char *idx_sql = sqlite3_mprintf(
+              "CREATE %s INDEX " CACHE_SCHEMA ".idx_%s_%d ON %s (%s)",
+              is_unique ? "UNIQUE" : "",
+              suffix,
+              idx_counter++,
+              quoted_temp,
+              cols
+          );
+
+          int idx_rc = sqlite3_exec(db, idx_sql, 0, 0, &err_msg);
+          sqlite3_free(idx_sql);
+
+          if (idx_rc != SQLITE_OK) {
+              sqlite3_finalize(stmt);
+              // Clean up and abort
+              char *cleanup = sqlite3_mprintf("DROP TABLE " CACHE_SCHEMA ".%s", quoted_temp);
+              sqlite3_exec(db, cleanup, 0, 0, 0);
+              sqlite3_free(cleanup);
+
+              sqlite3_free(quoted_temp);
+              sqlite3_free(quoted_real);
+              sqlite3_free(temp_table_name);
+              sqlite3_free(idx_query);
+              sqlite3_result_error(context, err_msg, -1);
+              sqlite3_free(err_msg);
+              return;
+          }
+      }
+  }
+  sqlite3_finalize(stmt);
+  sqlite3_free(idx_query);
+
+  // 5. Atomic Swap (Transaction)
+  // Blocks new writers, allows existing readers (WAL)
+  rc = sqlite3_exec(db, "BEGIN IMMEDIATE", 0, 0, &err_msg);
+  if (rc != SQLITE_OK) {
+      sqlite3_result_error(context, "Could not start transaction", -1);
+      sqlite3_free(err_msg);
+      goto cleanup;
+  }
+
+  // Drop old table
+  char *drop_old = sqlite3_mprintf("DROP TABLE IF EXISTS " CACHE_SCHEMA ".%s", quoted_real);
+  rc = sqlite3_exec(db, drop_old, 0, 0, &err_msg);
+  sqlite3_free(drop_old);
+
+  if (rc != SQLITE_OK) {
+      sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+      sqlite3_result_error(context, err_msg, -1);
+      sqlite3_free(err_msg);
+      goto cleanup;
+  }
+
+  // Rename Temp -> Real
+  char *rename_sql = sqlite3_mprintf("ALTER TABLE " CACHE_SCHEMA ".%s RENAME TO %s",
+                                     quoted_temp, quoted_real);
+                                     // Note: quoted_real includes quotes, which works for RENAME TO identifier
+                                     // BUT SQLite RENAME TO expects just the name or "name".
+                                     // Since quoted_real is "name", this is valid.
+  rc = sqlite3_exec(db, rename_sql, 0, 0, &err_msg);
+  sqlite3_free(rename_sql);
+
+  if (rc != SQLITE_OK) {
+      sqlite3_exec(db, "ROLLBACK", 0, 0, 0);
+      sqlite3_result_error(context, err_msg, -1);
+      sqlite3_free(err_msg);
+      goto cleanup;
+  }
+
+  // Update Timestamp
+  char *upd_sql = sqlite3_mprintf("UPDATE " CACHE_SCHEMA
+                                  "._mview_registry SET last_refreshed = "
+                                  "CURRENT_TIMESTAMP WHERE view_name = '%q'",
+                                  name);
+  sqlite3_exec(db, upd_sql, 0, 0, 0);
+  sqlite3_free(upd_sql);
+
+  sqlite3_exec(db, "COMMIT", 0, 0, 0);
+  sqlite3_result_text(context, "Refreshed", -1, SQLITE_TRANSIENT);
+
+  // Cleanup strings
+  sqlite3_free(quoted_temp);
+  sqlite3_free(quoted_real);
+  sqlite3_free(temp_table_name);
+  return;
+
+cleanup:
+  // If transaction failed, we might have a stray temp table
+  {
+      char *cleanup = sqlite3_mprintf("DROP TABLE IF EXISTS " CACHE_SCHEMA ".%s", quoted_temp);
+      sqlite3_exec(db, cleanup, 0, 0, 0);
+      sqlite3_free(cleanup);
+  }
+  sqlite3_free(quoted_temp);
+  sqlite3_free(quoted_real);
+  sqlite3_free(temp_table_name);
 }
 
 /*
@@ -524,6 +711,10 @@ int sqlite3_extension_init(sqlite3 *db, char **pzErrMsg,
   // mview_refresh('name')
   sqlite3_create_function(db, "mview_refresh", 1, SQLITE_UTF8, 0,
                           mview_refresh_func, 0, 0);
+
+  // mview_add_index('name', 'columns', is_unique)
+  sqlite3_create_function(db, "mview_add_index", 3, SQLITE_UTF8, 0,
+                          mview_add_index_func, 0, 0);
 
   // mview_drop('name')
   sqlite3_create_function(db, "mview_drop", 1, SQLITE_UTF8, 0, mview_drop_func,
