@@ -152,9 +152,10 @@ static int init_registry(sqlite3 *db, char **err_msg) {
 ** FUNCTION: mview_init
 ** SQL USAGE: SELECT mview_init('filename.db');
 ** ----------------------------------------------------------------------------
-** 1. Attaches the provided filename as the 'mviews' database.
-** 2. Sets WAL mode (Write-Ahead Logging) for concurrency.
-** 3. Creates the registry table.
+** 1. Checks if 'mviews' (CACHE_SCHEMA) is already attached.
+** 2. If not attached, attaches the provided filename.
+** 3. Ensures WAL mode is set (idempotent).
+** 4. Creates the registry table if missing.
 */
 static void mview_init_func(sqlite3_context *context, int argc,
                             sqlite3_value **argv) {
@@ -167,32 +168,46 @@ static void mview_init_func(sqlite3_context *context, int argc,
     return;
   }
 
-  // Use %Q to safely quote the file path (prevents injection via filename)
-  char *attach_sql =
-      sqlite3_mprintf("ATTACH DATABASE %Q AS " CACHE_SCHEMA, path);
-  int rc = sqlite3_exec(db, attach_sql, 0, 0, &err_msg);
-  sqlite3_free(attach_sql);
+  // 1. Check if the database alias is already attached.
+  // sqlite3_db_filename returns NULL if the schema name is not found.
+  const char *existing_schema_file = sqlite3_db_filename(db, CACHE_SCHEMA);
+  int is_attached = (existing_schema_file != NULL);
 
-  if (rc != SQLITE_OK) {
-    // This typically fails if the alias 'mviews' is already taken
-    sqlite3_result_error(context, err_msg, -1);
-    sqlite3_free(err_msg);
-    return;
+  // 2. Attach if not already attached
+  if (!is_attached) {
+    // Use %Q to safely quote the file path (prevents injection via filename)
+    char *attach_sql =
+        sqlite3_mprintf("ATTACH DATABASE %Q AS " CACHE_SCHEMA, path);
+    int rc = sqlite3_exec(db, attach_sql, 0, 0, &err_msg);
+    sqlite3_free(attach_sql);
+
+    if (rc != SQLITE_OK) {
+      sqlite3_result_error(context, err_msg, -1);
+      sqlite3_free(err_msg);
+      return;
+    }
   }
 
-  // Performance Optimization: Enable WAL mode.
-  // This allows the main app to read the cache while a background thread
-  // refreshes it.
+  // 3. Ensure WAL mode is set.
+  // We run this regardless of whether we just attached or it was already attached.
+  // SQLite handles this gracefully (if already WAL, it returns "wal" and does nothing).
   sqlite3_exec(db, "PRAGMA " CACHE_SCHEMA ".journal_mode=WAL", 0, 0, 0);
 
-  // Initialize the registry table
+  // 4. Initialize the registry table (Idempotent via IF NOT EXISTS)
   if (init_registry(db, &err_msg) != SQLITE_OK) {
     sqlite3_result_error(context, err_msg, -1);
     sqlite3_free(err_msg);
     return;
   }
-  sqlite3_result_text(context, "MView Storage Initialized", -1,
-                      SQLITE_TRANSIENT);
+
+  // Return specific status message
+  if (is_attached) {
+    sqlite3_result_text(context, "MView Storage Ready (Already Attached)", -1,
+                        SQLITE_TRANSIENT);
+  } else {
+    sqlite3_result_text(context, "MView Storage Initialized (Attached)", -1,
+                        SQLITE_TRANSIENT);
+  }
 }
 
 /*
