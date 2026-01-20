@@ -35,38 +35,41 @@
 ** 1. LOAD EXTENSION:
 **    .load ./mview
 **
-** 2. INITIALIZE (Attach the cache database):
+** 2. CHECK VERSION:
+**    SELECT mview_version(); -- Returns '2.0.0'
+**
+** 3. INITIALIZE (Attach the cache database):
 **    -- This creates 'cache.db' if missing and attaches it as 'mviews'
 **    SELECT mview_init('cache.db');
 **
-** 3. CREATE A VIEW (Simple Mode - Auto Types):
+** 4. CREATE A VIEW (Simple Mode - Auto Types):
 **    -- Creates table 'mviews.daily_sales'
 **    SELECT mview_create('daily_sales',
 **        'SELECT date, sum(total) FROM main.orders GROUP BY date'
 **    );
 **
-** 4. CREATE A VIEW (Strict Mode - Custom Schema):
+** 5. CREATE A VIEW (Strict Mode - Custom Schema):
 **    -- Useful for adding Primary Keys for performance
 **    SELECT mview_create('users_mv',
 **        'SELECT id, username FROM main.users',
 **        'id INTEGER PRIMARY KEY, username TEXT'
 **    );
 **
-** 5. QUERY DATA:
+** 6. QUERY DATA:
 **    SELECT * FROM mviews.daily_sales WHERE total > 1000;
 **
-** 6. REGISTER INDEX (Crucial for performance):
+** 7. REGISTER INDEX (Crucial for performance):
 **    -- Indexes are re-applied automatically after every refresh
 **    SELECT mview_add_index('daily_sales', 'date', 1); -- 1 = Unique
 **
-** 7. REFRESH DATA:
+** 8. REFRESH DATA:
 **    -- Re-runs the query and updates the table atomically
 **    SELECT mview_refresh('daily_sales');
 **
-** 8. DROP VIEW:
+** 9. DROP VIEW:
 **    SELECT mview_drop('daily_sales');
 **
-** 9. CLOSE / DETACH:
+** 10. CLOSE / DETACH:
 **    SELECT mview_close();
 **
 ** ============================================================================
@@ -77,6 +80,8 @@ SQLITE_EXTENSION_INIT1
 #include <string.h>
 #include <stdlib.h> /* For malloc/free if needed, though we use sqlite3_malloc */
 #include <stdio.h>
+
+#define MVIEW_VERSION "2.0.0"
 
 /*
 ** CONSTANT: CACHE_SCHEMA
@@ -177,6 +182,17 @@ static int init_registry(sqlite3 *db, char **err_msg) {
       "  FOREIGN KEY(view_name) REFERENCES _mview_registry(view_name) ON DELETE CASCADE"
       ");";
   return sqlite3_exec(db, sql, 0, 0, err_msg);
+}
+
+/*
+** FUNCTION: mview_version
+** SQL USAGE: SELECT mview_version();
+** ----------------------------------------------------------------------------
+** Returns the current version string.
+*/
+static void mview_version_func(sqlite3_context *context, int argc,
+                            sqlite3_value **argv) {
+    sqlite3_result_text(context, MVIEW_VERSION, -1, SQLITE_STATIC);
 }
 
 /*
@@ -605,6 +621,9 @@ cleanup:
 ** Permanently removes a view.
 ** 1. Deletes metadata from registry.
 ** 2. Drops the physical table.
+**
+** NOTE: We must manually delete from _mview_index_registry because Foreign
+** Key enforcement (ON DELETE CASCADE) is disabled by default in SQLite.
 */
 static void mview_drop_func(sqlite3_context *context, int argc,
                             sqlite3_value **argv) {
@@ -620,7 +639,7 @@ static void mview_drop_func(sqlite3_context *context, int argc,
 
   sqlite3_exec(db, "BEGIN TRANSACTION", 0, 0, 0);
 
-  // 1. Remove Registry Entry
+  // 1. Remove Registry Entry (Main)
   char *del_reg = sqlite3_mprintf("DELETE FROM " CACHE_SCHEMA
                                   "._mview_registry WHERE view_name = '%q'",
                                   name);
@@ -630,7 +649,17 @@ static void mview_drop_func(sqlite3_context *context, int argc,
   }
   sqlite3_free(del_reg);
 
-  // 2. Drop Physical Table
+  // 2. Remove Registry Entry (Indexes) - Manual Cleanup
+  char *del_idx = sqlite3_mprintf("DELETE FROM " CACHE_SCHEMA
+                                  "._mview_index_registry WHERE view_name = '%q'",
+                                  name);
+  if (sqlite3_exec(db, del_idx, 0, 0, &err_msg) != SQLITE_OK) {
+    sqlite3_free(del_idx);
+    goto error;
+  }
+  sqlite3_free(del_idx);
+
+  // 3. Drop Physical Table
   char *drop_tbl =
       sqlite3_mprintf("DROP TABLE IF EXISTS " CACHE_SCHEMA ".%s", quoted_name);
   int rc = sqlite3_exec(db, drop_tbl, 0, 0, &err_msg);
@@ -699,6 +728,10 @@ int sqlite3_extension_init(sqlite3 *db, char **pzErrMsg,
   // mview_init('filename')
   sqlite3_create_function(db, "mview_init", 1, SQLITE_UTF8, 0, mview_init_func,
                           0, 0);
+
+  // mview_version()
+  sqlite3_create_function(db, "mview_version", 0, SQLITE_UTF8, 0,
+                          mview_version_func, 0, 0);
 
   // mview_create('name', 'query') - 2 args
   sqlite3_create_function(db, "mview_create", 2, SQLITE_UTF8, 0,

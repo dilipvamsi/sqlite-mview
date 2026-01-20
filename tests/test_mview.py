@@ -373,6 +373,10 @@ class TestMViewExtension(unittest.TestCase):
         with self.assertRaisesRegex(sqlite3.OperationalError, "View not found"):
             self.conn.execute("SELECT mview_refresh('ghost')")
 
+    def test_version_check(self):
+        """Verify the version function returns the expected 2.0.0 string."""
+        ver = self.conn.execute("SELECT mview_version()").fetchone()[0]
+        self.assertEqual(ver, "2.0.0")
 
 if __name__ == "__main__":
     unittest.main()
