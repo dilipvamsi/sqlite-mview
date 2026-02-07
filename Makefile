@@ -5,6 +5,7 @@
 PROJECT = mview
 SRC = mview_extension.c
 BUILD_DIR = build
+DB_DIR = databases
 TEST_DIR = tests
 
 # Compiler Settings
@@ -63,15 +64,18 @@ all: clean directory $(TARGET_LIB)
 $(TARGET_LIB): $(SRC)
 	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) -o $@ $<
 
-# Create build directory
+# Create build and database directories
 directory:
 	@mkdir -p $(BUILD_DIR)
+	@mkdir -p $(DB_DIR)
 
 # Clean build artifacts
 clean:
 	rm -rf $(BUILD_DIR)
+	rm -rf $(DB_DIR)
 	rm -f *.db *.db-wal *.db-shm
 	rm -rf __pycache__ $(TEST_DIR)/__pycache__
+	rm -f *.gcov *.gcda *.gcno
 
 # ----------------------------------------------------------------------------
 # Specific Build Targets (Convenience / Cross-Compilation)
@@ -96,7 +100,41 @@ macos_universal: directory
 test: all
 	@echo "Running Tests..."
 	@# Pass the path of the compiled library to Python via Environment Variable
-	@EXT_PATH=$(TARGET_LIB) $(PYTHON) $(TEST_DIR)/test_mview.py
+	@# Also pass DB_DIR via TEST_DB_PATH
+	@EXT_PATH=$(TARGET_LIB) TEST_DB_PATH=$(DB_DIR)/test_cache.db $(PYTHON) $(TEST_DIR)/test_mview.py
 	@echo "Tests Passed!"
 
-.PHONY: all clean directory windows windows32 macos_universal test
+
+# ----------------------------------------------------------------------------
+# Code Quality Goals (100% Coverage & No Leaks)
+# ----------------------------------------------------------------------------
+
+coverage: clean directory
+	@# 1. Compile with coverage flags
+	$(CC) $(CFLAGS) $(INCLUDES) -fprofile-arcs -ftest-coverage -c $(SRC) -o $(BUILD_DIR)/mview_extension.o
+	$(CC) $(LDFLAGS) -fprofile-arcs -ftest-coverage -o $(TARGET_LIB) $(BUILD_DIR)/mview_extension.o
+
+	@# 2. Run Tests to generate .gcda data
+	@echo "Running Tests for Coverage..."
+	@EXT_PATH=$(TARGET_LIB) TEST_DB_PATH=$(DB_DIR)/test_cache.db $(PYTHON) $(TEST_DIR)/test_mview.py
+
+	@# 3. Generate Report
+	@echo "Generating Coverage Report..."
+	gcov $(SRC) -o $(BUILD_DIR)
+	@mv -f *.gcov $(BUILD_DIR)/ 2>/dev/null || true
+	@echo "Coverage Report Generated: $(BUILD_DIR)/mview_extension.c.gcov"
+
+leak-check: clean directory
+	@# 1. Compile Extension (Standard Debug)
+	$(CC) $(CFLAGS) $(INCLUDES) $(LDFLAGS) -o $(TARGET_LIB) $(SRC)
+
+	@# 2. Compile Leak Checker
+	$(CC) -g $(TEST_DIR)/leak_check.c -lsqlite3 -o $(BUILD_DIR)/leak_check
+
+	@# 3. Run Valgrind (ignore 'still reachable' blocks from SQLite internals)
+	@echo "Running Valgrind Memory Check..."
+	@cd $(BUILD_DIR) && TEST_DB_PATH=../$(DB_DIR)/leak_test_cache.db valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible --error-exitcode=1 ./leak_check
+
+check: test leak-check coverage
+
+.PHONY: all clean directory windows windows32 macos_universal test coverage leak-check check

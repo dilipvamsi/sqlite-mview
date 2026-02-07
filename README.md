@@ -1,22 +1,20 @@
-# SQLite Memorized Views (sqlite-mview)
+# SQLite Memorized Views (sqlite-mview) v3.0
 
-![License](https://img.shields.io/badge/license-MIT-blue.svg) ![Platform](https://img.shields.io/badge/platform-sqlite-green.svg) ![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)
+![License](https://img.shields.io/badge/license-MIT-blue.svg) ![Platform](https://img.shields.io/badge/platform-sqlite-green.svg) ![Coverage](https://img.shields.io/badge/coverage-83%25-brightgreen.svg)
 
 A robust, persistent, and **concurrent** Materialized View extension for SQLite.
 
 While standard SQLite views are virtual (re-calculated every time you query them), **sqlite-mview** "memorizes" the results of complex queries into real physical tables.
 
 ### ⚡ Key Benefits
-*   **Instant Reads:** No matter how complex the source query (Joins, Aggregates, Window Functions), reading the view is O(1).
-*   **Non-Blocking Refreshes:** Uses a **Shadow Paging** strategy. Readers can continue to read old data while the new view is being calculated in the background.
+*   **Instant Reads:** No matter how complex the source query, reading the view is O(1).
+*   **Non-Blocking Refreshes:** Uses **Shadow Paging** - readers continue reading old data during refresh.
 *   **Zero Main-DB Bloat:** All view data is stored in a separate, attached database file.
-*   **Persistent Indexes:** Indexes are automatically managed and re-applied after every refresh.
+*   **Persistent Indexes:** Indexes are automatically re-applied after every refresh.
 
 ---
 
 ## 🏗️ Architecture
-
-This extension uses the **"Sidecar Database" pattern**. It attaches a secondary database file to your connection to store the cache.
 
 ```text
 +-------------+        +--------------------------+
@@ -28,156 +26,198 @@ This extension uses the **"Sidecar Database" pattern**. It attaches a secondary 
 +--------------------------+
 |  Cache Database (mviews) |
 | ------------------------ |
-|  [ table: daily_stats ]  | <--- Physical Table
-|  [ table: user_counts ]  |
+|  [ _mview_registry ]     | <--- Metadata
+|  [ daily_stats ]         | <--- Physical Table
+|  [ user_counts ]         |
 +--------------------------+
 ```
 
 ---
 
-## 🚀 Features
-
-*   **Shadow Paging Strategy:** Refreshes are performed by creating a temporary table, populating it, indexing it, and then atomically swapping it with the live table.
-*   **High Concurrency:** The refresh operation is **non-blocking** for readers.
-*   **Strict Typing:** Option to define Primary Keys and strict column types.
-*   **WAL Mode:** Automatically enables Write-Ahead Logging on the cache DB.
-*   **Index Registry:** Maintains a registry of indexes and automatically re-builds them whenever the view is refreshed.
-
----
-
-## 🛠️ Installation & Building
-
-### Prerequisites
-*   GCC or Clang compiler.
-*   `sqlite3ext.h` (Included in `libsqlite3-dev` on Linux).
-
-### Build
-Run the `make` command. It automatically detects your OS.
+## 🛠️ Installation
 
 ```bash
-make
+make                 # Build: Linux=mview.so, macOS=mview.dylib, Windows=mview.dll
+make test            # Run tests
+make coverage        # Generate coverage report (83%+)
+make leak-check      # Valgrind memory check
 ```
-*   **Linux:** `build/mview.so`
-*   **macOS:** `build/mview.dylib`
-*   **Windows:** `build/mview.dll`
-
-> **Troubleshooting:** If the build fails with `fatal error: sqlite3ext.h: No such file`, you need to install SQLite development headers (e.g., `sudo apt install libsqlite3-dev`) or download the amalgamation zip from sqlite.org and place `sqlite3ext.h` in this folder.
 
 ---
 
-## 📖 Usage Guide
-
-### 1. Load the Extension
-Start `sqlite3` (or your app) and load the binary.
+## 📖 Quick Start
 
 ```sql
+-- 1. Load extension
 .load ./build/mview
-```
 
-### 2. Initialize the Storage
-Initialize the "cache" database.
+-- 2. Initialize storage (2-step process in v3.0)
+SELECT mview_attach('cache.db');   -- Attach file as 'mviews'
+SELECT mview_init();               -- Create registry tables
 
-```sql
--- Creates (or opens) 'cache.db' and attaches it as 'mviews'
-SELECT mview_init('cache.db');
-```
+-- 3. Create views
+SELECT mview_create('daily_stats',
+    'SELECT date, sum(amount) as total FROM main.orders GROUP BY date');
 
-### 3. Create a View (Simple Mode)
-SQLite automatically detects column types based on the result.
+-- With explicit schema (for PRIMARY KEYs)
+SELECT mview_create('users_mv', 'SELECT id, name FROM main.users',
+    'id INTEGER PRIMARY KEY, name TEXT');
 
-```sql
-SELECT mview_create(
-    'daily_stats',
-    'SELECT date, sum(total) as revenue FROM main.orders GROUP BY date'
-);
-```
+-- 4. Add indexes (survive refreshes)
+SELECT mview_add_index('daily_stats', 'date', 1);   -- 1 = UNIQUE
+SELECT mview_add_index('daily_stats', 'total', 0);  -- 0 = Non-unique
 
-> **💡 Best Practice:** Always prefix your source tables with `main.` (e.g., `SELECT * FROM main.orders`). This guarantees your view reads from your actual database, preventing conflicts if a temporary table with the same name exists.
+-- 5. Query (fast!)
+SELECT * FROM mviews.daily_stats WHERE total > 1000;
 
-### 4. Create a View (Strict Mode)
-Use this to define a **Primary Key** or specific types.
-
-```sql
-SELECT mview_create(
-    'users_summary',
-    -- Source Query
-    'SELECT id, username, count(*) FROM main.users JOIN main.posts ON u.id = p.user_id GROUP BY u.id',
-    -- Schema Definition
-    'id INTEGER PRIMARY KEY, username TEXT, post_count INTEGER'
-);
-```
-
-### 5. Add Indexes (Crucial!)
-Because the table is dropped and re-created during a refresh, you **cannot** use standard `CREATE INDEX` SQL, as the index would disappear after the next refresh.
-Use `mview_add_index` instead:
-
-```sql
--- Format: mview_add_index(view_name, columns, is_unique_boolean)
-
--- Create a standard index on 'revenue'
-SELECT mview_add_index('daily_stats', 'revenue', 0);
-
--- Create a UNIQUE index on 'date'
-SELECT mview_add_index('daily_stats', 'date', 1);
-```
-
-### 6. Refresh the Data
-Trigger a refresh when your main data changes.
-
-```sql
+-- 6. Refresh when data changes
 SELECT mview_refresh('daily_stats');
+SELECT mview_refresh_all();           -- Refresh all views
+SELECT mview_refresh_stale(3600);     -- Refresh views older than 1 hour
+
+-- 7. Introspection
+SELECT * FROM mview_registry;              -- List all views
+SELECT mview_has('daily_stats');           -- Check if exists (1|0)
+SELECT mview_query('daily_stats');         -- Get source query
+SELECT mview_schema('daily_stats');        -- Column schema (JSON)
+SELECT mview_indexes('daily_stats');       -- Registered indexes (JSON)
+SELECT mview_info('daily_stats');          -- Full metadata (JSON)
+SELECT mview_stats('daily_stats');         -- Row count & size
+SELECT mview_verify('daily_stats');        -- Schema consistency check
+SELECT mview_explain('daily_stats');       -- Show source query
+SELECT mview_export('daily_stats');        -- Export as SQL
+
+-- 8. Time-based cache management
+SELECT mview_last_refreshed('daily_stats'); -- Timestamp of last refresh
+SELECT mview_age('daily_stats');            -- Seconds since refresh
+SELECT mview_stale('daily_stats', 3600);    -- 1 if older than 1 hour
+
+-- 9. Index management
+SELECT mview_remove_index('daily_stats', 'total');
+SELECT mview_reindex('daily_stats');       -- Rebuild indexes
+
+-- 10. Logging
+SELECT mview_log_enable(1);    -- Enable logging
+SELECT mview_log();            -- View last 50 log entries
+SELECT mview_log_clear();      -- Clear all logs
+SELECT mview_log_enable(0);    -- Disable logging
+
+-- 11. Schema evolution
+SELECT mview_rename('daily_stats', 'sales_by_day');
+
+-- 12. Cleanup
+SELECT mview_drop('sales_by_day');         -- Drop single view
+SELECT mview_drop_all();                   -- Drop all views
+SELECT mview_vacuum();                     -- Vacuum cache DB
+SELECT mview_dettach();                    -- Detach storage
+
+-- Version check
+SELECT mview_version();  -- Returns '3.0.0'
 ```
-*This performs the following atomic steps:*
-1. Creates a temporary table (e.g., `daily_stats_new_a1b2`).
-2. Populates it from the source query (Readers continue reading the old table).
-3. Applies registered indexes to the temporary table.
-4. Swaps the tables inside a transaction.
 
-### 7. Query the Data
-The views exist in the `mviews` schema.
+## 📚 API Reference
 
-```sql
--- Fast read from physical table
-SELECT * FROM mviews.daily_stats WHERE revenue > 1000;
-```
+### Core Functions
 
-### 8. Drop a View
-Permanently remove a view, its indexes, and its metadata.
+| Function | Description |
+|----------|-------------|
+| `mview_version()` | Returns version string ('3.0.0') |
+| `mview_attach(path)` | Attach cache database file |
+| `mview_init()` | Initialize registry tables |
+| `mview_dettach()` | Detach cache database |
 
-```sql
-SELECT mview_drop('daily_stats');
-```
+### View Management
 
-### 9. Clean Up
-Detaches the cache database. Data persists on disk.
+| Function | Description |
+|----------|-------------|
+| `mview_create(name, query)` | Create view with auto-schema |
+| `mview_create(name, query, schema)` | Create view with explicit schema (e.g., `'id INTEGER PRIMARY KEY, name TEXT'`) |
+| `mview_refresh(name)` | Refresh single view (atomic swap) |
+| `mview_drop(name)` | Drop view and its metadata |
+| `mview_rename(old, new)` | Rename a view |
 
-```sql
-SELECT mview_close();
-```
+### Index Management
+
+| Function | Description |
+|----------|-------------|
+| `mview_add_index(view, cols, unique)` | Register index (unique=1 or 0) |
+| `mview_remove_index(view, cols)` | Remove registered index |
+| `mview_reindex(view)` | Rebuild all indexes |
+
+### Introspection
+
+| Function | Description |
+|----------|-------------|
+| `mview_registry` | Virtual table listing all views |
+| `mview_has(name)` | Returns 1 if view exists, 0 otherwise |
+| `mview_query(name)` | Returns the stored source query |
+| `mview_schema(name)` | Returns column schema as JSON |
+| `mview_indexes(name)` | Returns registered indexes as JSON |
+| `mview_last_refreshed(name)` | Returns timestamp of last refresh |
+| `mview_age(name)` | Returns seconds since last refresh |
+| `mview_stale(name, secs)` | Returns 1 if older than secs, 0 otherwise |
+| `mview_info(name)` | JSON metadata for a view |
+| `mview_stats(name)` | Row count and size info |
+| `mview_size(name)` | Disk size in bytes |
+| `mview_count()` | Total number of registered views |
+| `mview_verify(name)` | Schema consistency check |
+| `mview_explain(name)` | Show source query |
+| `mview_export(name)` | Export view definition as SQL |
+
+### Bulk Operations
+
+| Function | Description |
+|----------|-------------|
+| `mview_refresh_all()` | Refresh all views |
+| `mview_refresh_stale(secs)` | Refresh views older than secs |
+| `mview_drop_all()` | Drop all views |
+| `mview_truncate(name)` | Clear all data but keep metadata |
+| `mview_vacuum()` | Vacuum the cache database |
+
+### Logging
+
+| Function | Description |
+|----------|-------------|
+| `mview_log_enable(1\|0)` | Enable/disable operation logging |
+| `mview_log()` | Returns last 50 log entries as JSON |
+| `mview_log(limit)` | Returns last N log entries as JSON |
+| `mview_log_clear()` | Clear all log entries |
+
+---
+
+## 💡 Best Practices
+
+1. **Prefix source tables with `main.`** to avoid conflicts:
+   ```sql
+   SELECT mview_create('stats', 'SELECT * FROM main.orders');
+   ```
+
+2. **Use strict schema for PRIMARY KEYs:**
+   ```sql
+   SELECT mview_create('users', 'SELECT id, name FROM main.users',
+       'id INTEGER PRIMARY KEY, name TEXT');
+   ```
+
+3. **Register indexes before first refresh** - they're applied automatically on every refresh.
 
 ---
 
 ## ⚠️ Limitations
 
-1.  **Full Refresh Only:** This extension performs a complete recalculation. It does not support "Incremental Updates" (delta updates). It is best suited for complex read-heavy queries rather than massive write-heavy tables.
-2.  **Attached DBs:** SQLite has a limit on attached databases (usually 10 or 30). This extension uses one slot.
-3.  **Space Usage:** During a refresh, disk usage for that specific view temporarily doubles (Old Table + New Table) until the swap is complete.
+*   **Full Refresh Only:** No incremental updates. Best for read-heavy workloads.
+*   **Attached DB Limit:** Uses 1 of SQLite's ~10 available attachment slots.
+*   **Temporary Space:** During refresh, disk usage doubles briefly.
 
 ---
 
 ## 🧪 Testing
 
-This project includes a Python-based test suite.
-
 ```bash
-make test
+make test         # 59 tests
+make coverage     # 83%+ line coverage
+make leak-check   # Valgrind: 0 leaks
+make check        # Run all above
 ```
-
-The test suite covers:
-*   Creation, Querying, and Dropping.
-*   **Shadow Swap Verification:** Ensuring indexes survive refreshes.
-*   **Unique Constraints:** Ensuring refreshes fail safely if unique constraints are violated.
-*   **Concurrency:** Ensuring initialization is idempotent.
 
 ---
 
